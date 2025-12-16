@@ -1,12 +1,11 @@
 #!/bin/bash
 
 ###############################################################################
-# GPU-Only FEP Simulation Runner with Memory Checking
-# - Traverses fe/lig-*/rest/ and fe/lig-*/sdr/ subdirectories
-# - Finds all window folders (c*, m*, e*, v*, etc.)
-# - Runs run-local.bash in each window
-# - Robust GPU memory checking
-# - One job per GPU at a time
+# GPU-Only FEP Simulation Runner - ULTRA ROBUST VERSION
+# - NEVER skips windows due to GPU availability
+# - WAITS indefinitely for GPUs to become available
+# - Only skips windows that are TRULY completed with strict checking
+# - All windows with run-local.bash WILL be executed
 ###############################################################################
 
 FE_DIR="./fe"
@@ -16,11 +15,44 @@ REQUIRED_FREE_MEMORY=8000  # Minimum free memory in MB
 # Get absolute paths
 WORK_DIR=$(pwd)
 LOG_DIR="${WORK_DIR}/fe_logs"
+DISCOVERY_LOG="${LOG_DIR}/window_discovery.log"
 mkdir -p "$LOG_DIR"
 
 # Track GPU assignments
 declare -A GPU_JOBS
 declare -A GPU_WINDOWS
+
+###############################################################################
+# Function: STRICT completion check - only mark as complete if truly finished
+###############################################################################
+is_window_truly_completed() {
+    local window_dir="$1"
+    
+    # Look for the most common FEP completion files
+    # Must check STRICTLY - not just that file exists, but that it's actually complete
+    
+    # Check for md-02.out specifically (common final stage in BAT)
+    if [ -f "$window_dir/md-02.out" ]; then
+        # Must have BOTH "TIMINGS" section AND proper ending
+        if grep -q "TIMINGS" "$window_dir/md-02.out" 2>/dev/null && \
+           grep -q "Total wall time:" "$window_dir/md-02.out" 2>/dev/null; then
+            return 0  # Truly complete
+        fi
+    fi
+    
+    # Check for other common final output files with strict criteria
+    for outfile in prod.out production.out final.out; do
+        if [ -f "$window_dir/$outfile" ]; then
+            if grep -q "TIMINGS" "$window_dir/$outfile" 2>/dev/null && \
+               grep -q "Total wall time:" "$window_dir/$outfile" 2>/dev/null; then
+                return 0  # Truly complete
+            fi
+        fi
+    done
+    
+    # NOT complete - need to run
+    return 1
+}
 
 ###############################################################################
 # Function: Get GPU free memory in MB
@@ -99,10 +131,13 @@ find_available_gpu() {
 }
 
 ###############################################################################
-# Function: Wait for GPU with sufficient memory
+# Function: Wait INDEFINITELY for GPU - NEVER give up
 ###############################################################################
-wait_for_gpu() {
+wait_for_gpu_forever() {
     local wait_count=0
+    local window_desc="$1"
+    
+    echo "[$(date '+%H:%M:%S')] Waiting for GPU for: $window_desc"
     
     while true; do
         cleanup_finished_jobs
@@ -110,13 +145,15 @@ wait_for_gpu() {
         local gpu_id=$(find_available_gpu)
         
         if [ $gpu_id -ge 0 ]; then
+            echo "[$(date '+%H:%M:%S')] GPU $gpu_id became available for: $window_desc"
             echo $gpu_id
             return 0
         fi
         
+        # Show status every 30 seconds
         if [ $((wait_count % 10)) -eq 0 ]; then
-            echo "[$(date '+%H:%M:%S')] Waiting for GPU with ${REQUIRED_FREE_MEMORY}MB+ free memory..."
-            show_gpu_status
+            echo "[$(date '+%H:%M:%S')] Still waiting for GPU (${REQUIRED_FREE_MEMORY}MB+ needed) for: $window_desc"
+            show_gpu_status_brief
         fi
         
         ((wait_count++))
@@ -138,7 +175,31 @@ cleanup_finished_jobs() {
 }
 
 ###############################################################################
-# Function: Show GPU status
+# Function: Show brief GPU status
+###############################################################################
+show_gpu_status_brief() {
+    local busy_count=0
+    local free_count=0
+    local low_mem_count=0
+    
+    for gpu_id in $(seq 0 $((NUM_GPUS - 1))); do
+        if [ -n "${GPU_JOBS[$gpu_id]}" ]; then
+            ((busy_count++))
+        else
+            local free_mem=$(get_gpu_free_memory $gpu_id)
+            if [ $free_mem -ge $REQUIRED_FREE_MEMORY ]; then
+                ((free_count++))
+            else
+                ((low_mem_count++))
+            fi
+        fi
+    done
+    
+    echo "  GPUs: $busy_count busy, $free_count available, $low_mem_count low memory"
+}
+
+###############################################################################
+# Function: Show detailed GPU status
 ###############################################################################
 show_gpu_status() {
     echo ""
@@ -210,13 +271,17 @@ run_window() {
 ###############################################################################
 
 echo "========================================================================"
-echo "GPU-Only FEP Simulation Runner"
+echo "GPU-Only FEP Simulation Runner - ULTRA ROBUST"
 echo "========================================================================"
 echo "Working directory: $WORK_DIR"
 echo "FE directory: $FE_DIR"
 echo "Log directory: $LOG_DIR"
 echo "Number of GPUs: $NUM_GPUS"
 echo "Required free memory: ${REQUIRED_FREE_MEMORY} MB"
+echo ""
+echo "GUARANTEE: Every window with run-local.bash WILL be executed"
+echo "            Script will WAIT indefinitely for GPU availability"
+echo "            NO windows will be skipped due to lack of resources"
 echo "========================================================================"
 echo ""
 
@@ -241,7 +306,7 @@ while IFS=, read -r idx name total free; do
 done
 echo ""
 
-# Find all ligand folders
+# Find all ligand folders (case-insensitive)
 shopt -s nullglob nocaseglob
 lig_folders=("$FE_DIR"/lig-*)
 shopt -u nullglob nocaseglob
@@ -254,71 +319,130 @@ fi
 echo "Found ${#lig_folders[@]} ligand folders"
 echo ""
 
-# Collect all windows
+# Initialize discovery log
+echo "=== FEP Window Discovery Log ===" > "$DISCOVERY_LOG"
+echo "Timestamp: $(date)" >> "$DISCOVERY_LOG"
+echo "Mode: ULTRA ROBUST - No windows skipped due to resources" >> "$DISCOVERY_LOG"
+echo "" >> "$DISCOVERY_LOG"
+
+# Collect all windows - with STRICT completion checking
 all_windows=()
+completed_windows=0
+incomplete_windows=0
+
+echo "Scanning for windows..."
+echo ""
 
 for lig_dir in "${lig_folders[@]}"; do
     ligand=$(basename "$lig_dir")
-    echo "Scanning $ligand..."
+    echo "Ligand: $ligand" | tee -a "$DISCOVERY_LOG"
     
-    # Check for rest and sdr subdirectories
-    for subdir in rest sdr; do
-        subdir_path="$lig_dir/$subdir"
+    # Check for rest and sdr subdirectories (CASE-INSENSITIVE)
+    for subdir_variant in rest REST Rest sdr SDR Sdr; do
+        subdir_path="$lig_dir/$subdir_variant"
         
         if [ ! -d "$subdir_path" ]; then
-            echo "  WARNING: $ligand/$subdir not found, skipping"
             continue
         fi
         
-        # Find all window directories (any folder with run-local.bash)
-        shopt -s nullglob
+        # Normalize subdir name for output
+        subdir=$(echo "$subdir_variant" | tr '[:upper:]' '[:lower:]')
+        
+        # Find ALL subdirectories
+        shopt -s nullglob dotglob
         windows=("$subdir_path"/*)
-        shopt -u nullglob
+        shopt -u nullglob dotglob
         
         for window in "${windows[@]}"; do
-            if [ -d "$window" ] && [ -f "$window/run-local.bash" ]; then
+            # Skip if not a directory
+            if [ ! -d "$window" ]; then
+                continue
+            fi
+            
+            # Skip hidden directories
+            window_name=$(basename "$window")
+            if [[ "$window_name" == .* ]]; then
+                continue
+            fi
+            
+            # Check for run-local.bash
+            if [ ! -f "$window/run-local.bash" ]; then
+                echo "  SKIP: $ligand/$subdir/$window_name (no run-local.bash)" | tee -a "$DISCOVERY_LOG"
+                continue
+            fi
+            
+            # STRICT completion check
+            if is_window_truly_completed "$window"; then
+                echo "  SKIP: $ligand/$subdir/$window_name (verified complete)" | tee -a "$DISCOVERY_LOG"
+                ((completed_windows++))
+            else
+                echo "  WILL RUN: $ligand/$subdir/$window_name" | tee -a "$DISCOVERY_LOG"
                 all_windows+=("$window")
-                window_name=$(basename "$window")
-                echo "  Found: $ligand/$subdir/$window_name"
+                ((incomplete_windows++))
             fi
         done
     done
 done
 
-echo ""
+echo "" | tee -a "$DISCOVERY_LOG"
 echo "========================================================================"
-echo "Total windows found: ${#all_windows[@]}"
+echo "Discovery Complete"
+echo "========================================================================"
+echo "Windows to SKIP (already complete): $completed_windows"
+echo "Windows to RUN: $incomplete_windows"
 echo "========================================================================"
 echo ""
+
+# Save complete list to log
+echo "" >> "$DISCOVERY_LOG"
+echo "=== All Windows to Execute ===" >> "$DISCOVERY_LOG"
+for window in "${all_windows[@]}"; do
+    echo "$window" >> "$DISCOVERY_LOG"
+done
 
 if [ ${#all_windows[@]} -eq 0 ]; then
-    echo "ERROR: No windows with run-local.bash found"
-    exit 1
+    echo "All windows are already completed!"
+    echo "If this is incorrect, check completion criteria in the script."
+    echo "Check the discovery log: $DISCOVERY_LOG"
+    exit 0
 fi
 
-# Process each window
+echo "Starting execution - processing ${#all_windows[@]} windows"
+echo ""
+
+# Process each window - GUARANTEED execution
+window_num=0
 for window_dir in "${all_windows[@]}"; do
-    # Wait for available GPU
+    ((window_num++))
+    window_path=$(realpath --relative-to="$WORK_DIR" "$window_dir")
+    
+    echo "========================================================================"
+    echo "Window $window_num/${#all_windows[@]}: $window_path"
+    echo "========================================================================"
+    
+    # Find available GPU - if none available, WAIT (don't skip!)
     gpu_id=$(find_available_gpu)
     
     if [ $gpu_id -lt 0 ]; then
-        gpu_id=$(wait_for_gpu)
+        # NO GPU available - WAIT for one
+        gpu_id=$(wait_for_gpu_forever "$window_path")
     fi
     
-    # Run window
+    # Run window on the available GPU
     run_window "$window_dir" "$gpu_id"
     
-    # Brief delay
-    sleep 1
+    # Brief delay before checking next window
+    sleep 2
 done
 
 echo ""
 echo "========================================================================"
-echo "All windows submitted. Waiting for completion..."
+echo "All windows submitted. Waiting for final jobs to complete..."
 echo "========================================================================"
 echo ""
 
 # Show periodic status while jobs run
+status_count=0
 while true; do
     cleanup_finished_jobs
     
@@ -326,45 +450,80 @@ while true; do
         break
     fi
     
-    show_gpu_status
-    sleep 10
+    # Show status every 30 seconds
+    if [ $((status_count % 10)) -eq 0 ]; then
+        echo "[$(date '+%H:%M:%S')] Waiting for ${#GPU_JOBS[@]} jobs to complete..."
+        show_gpu_status
+    fi
+    
+    ((status_count++))
+    sleep 3
 done
 
 echo ""
 echo "========================================================================"
-echo "All FEP simulations completed"
+echo "ALL FEP SIMULATIONS COMPLETED"
 echo "========================================================================"
 echo ""
 
 # Summary
-total=$(ls -1 "$LOG_DIR"/*.log 2>/dev/null | wc -l)
-completed=0
+total_windows=${#all_windows[@]}
+newly_completed=0
 failed=0
 
 for log in "$LOG_DIR"/*.log; do
+    if [ "$log" == "$LOG_DIR/*.log" ] || [[ "$log" == *window_discovery* ]]; then
+        continue
+    fi
+    
     if grep -q "Exit Code: 0" "$log" 2>/dev/null; then
-        ((completed++))
+        ((newly_completed++))
     else
-        ((failed++))
+        # Check if this log is for a window we just ran
+        for window in "${all_windows[@]}"; do
+            window_path=$(realpath --relative-to="$WORK_DIR" "$window")
+            log_name=$(echo "$window_path" | tr '/' '_')
+            if [[ "$log" == *"$log_name"* ]]; then
+                ((failed++))
+                break
+            fi
+        done
     fi
 done
 
-echo "Summary:"
-echo "  Total windows: $total"
-echo "  ✓ Completed: $completed"
+echo "Execution Summary:"
+echo "  Windows attempted: $total_windows"
+echo "  ✓ Successfully completed: $newly_completed"
 echo "  ✗ Failed: $failed"
+echo "  Previously complete (skipped): $completed_windows"
 echo ""
 
 if [ $failed -gt 0 ]; then
-    echo "Failed windows:"
+    echo "FAILED windows (need investigation):"
     for log in "$LOG_DIR"/*.log; do
+        if [[ "$log" == *window_discovery* ]]; then
+            continue
+        fi
+        
         if ! grep -q "Exit Code: 0" "$log" 2>/dev/null; then
-            window=$(basename "$log" | sed 's/_gpu[0-9]*\.log$//')
-            echo "  - $(echo $window | tr '_' '/')"
+            for window in "${all_windows[@]}"; do
+                window_path=$(realpath --relative-to="$WORK_DIR" "$window")
+                log_name=$(echo "$window_path" | tr '/' '_')
+                if [[ "$log" == *"$log_name"* ]]; then
+                    echo "  - $window_path"
+                    echo "    Log: $log"
+                    break
+                fi
+            done
         fi
     done
     echo ""
 fi
 
 echo "Logs in: $LOG_DIR"
+echo "Window discovery log: $DISCOVERY_LOG"
+echo ""
+echo "========================================================================"
+echo "GUARANTEE MET: All ${#all_windows[@]} windows were executed"
+echo "              (not counting previously completed windows)"
 echo "========================================================================"
